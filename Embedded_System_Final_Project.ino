@@ -9,6 +9,7 @@
 /*******************************************************************************
 * INCLUDE
 *******************************************************************************/
+#include <avr/pgmspace.h>
 #include <Wire.h>
 #include <Servo.h>
 #include <ICM_20948.h>
@@ -17,7 +18,9 @@
 
 // These must be defined before including TinyEKF.h
 #define Nsta 3 // 3 state values: posX, posY, and orientation
-#define Mobs 2 // 2 measurements: gyroZ, and distance
+#define Mobs 3 // 3 measurements: gyroZ, accelX, and accelY
+// #define Mobs 4 // 4 measurements: gyroZ, accelX, and accelY and distance (optional due to the lack of resources)
+
 #include <TinyEKF.h>
 
 /******************************************************************************
@@ -43,9 +46,15 @@ enum class car_direction{
     RIGHT
 };
 
+struct Point {
+  double x;
+  double y;
+};
+
 class Fuser : public TinyEKF {
     public:
-        Fuser() {
+        Fuser() 
+        {
             for (int i = 0; i < Nsta; ++i) 
             {
                 setQ(i, i, 0.001);
@@ -58,27 +67,33 @@ class Fuser : public TinyEKF {
         }
 
     protected:
-        void model(double fx[Nsta], double F[Nsta][Nsta], double hx[Mobs], double H[Mobs][Nsta]) 
+        void Fuser::model(double fx[Nsta], double F[Nsta][Nsta], double hx[Mobs], double H[Mobs][Nsta]) 
         {
             // Process model
-            double dt = 0.1; // Time step, assuming constant (you should adjust this according to the actual time step in your system)
+            double dt = 0.1; // Time step, assuming constant
 
+            // double gyroZ = this->z[0]; // Get the gyroZ measurement from the EKF's z array
+
+            // Process model is f(x) = x, try to make it linearly
             fx[0] = this->x[0]; // Keep posX constant
             fx[1] = this->x[1]; // Keep posY constant
-            fx[2] = this->x[2]; // Keep orientation constant (this is an oversimplification, you may want to use a more sophisticated model)
+            // fx[2] = this->x[2] + dt * gyroZ; // Update orientation based on gyroZ measurement
+            fx[2] = this->x[2] + dt * this->x[2]; // Update orientation based on gyroZ measurement
 
-            // Process model Jacobian (F)
+            // So process model Jacobian is identity matrix
             F[0][0] = 1;
             F[1][1] = 1;
             F[2][2] = 1;
 
             // Measurement model (hx)
             hx[0] = this->x[2]; // gyroZ is directly mapped to orientation
-            hx[1] = this->x[1]; // distance is directly mapped to posY
+            hx[1] = this->x[0]; // accelX is directly mapped to posX
+            hx[2] = this->x[1]; // accelY is directly mapped to posY
 
             // Measurement model Jacobian (H)
             H[0][2] = 1; // gyroZ to orientation
-            H[1][1] = 1; // distance to posY
+            H[1][0] = 1; // accelX to posX
+            H[2][1] = 1; // accelY to posY
         }
 };
 
@@ -87,10 +102,24 @@ class Fuser : public TinyEKF {
 *******************************************************************************/
 const byte pingPin = 9; // Trigger Pin of Ultrasonic Sensor
 const byte echoPin = 10; // Echo Pin of Ultrasonic Sensor
-ultrasonic hcsr04(pingPin, echoPin, 400);
+ultrasonic hcsr04(pingPin, echoPin, 400); 
 ICM_20948_I2C myICM;
 Servo servo;
+Servo servoMotorLeft;   
+Servo servoMotorRight;
 Fuser ekf;
+
+// Temporarily predefined path at the beginning, will edit later
+Point waypoints[4] = {
+  {0, 0},
+  {10, 0},
+  {10, 10},
+  {0, 10}
+};
+
+// Servo motor objects for steering and throttle control
+Servo steeringServo;
+Servo throttleServo;
 
 /******************************************************************************
 * FUNCTION PROTOTYPES
@@ -99,6 +128,9 @@ void initializeIMU(void);
 void printRawAGMTIMU(ICM_20948_AGMT_t agmt);
 void printPaddedInt16bIMU(int16_t val);
 car_direction updateOrientation(void);
+double distance(Point a, Point b);
+void updateCarMovement(void);
+void updateServoMotors(car_direction desiredDirection);
 
 /******************************************************************************
 * 2 MAIN ENTRANCE FUNCTIONS
@@ -135,6 +167,14 @@ void setup()
     byte servoPin = 11;
     servo.attach(servoPin);
 
+    // Attach the servo motors to the corresponding pins
+    steeringServo.attach(3);
+    throttleServo.attach(5);
+
+    // Initialize the servo motors
+    steeringServo.write(90);
+    throttleServo.write(90);
+
     // Start some configuration for signal processing and 
     // required algorithms here
 }
@@ -145,7 +185,7 @@ void loop()
     // Get IMU data
     if(myICM.dataReady())
     {
-        rawData = myICM.getAGMT();  // The values are only updated when you call 'getAGMT'
+        rawData = myICM.getAGMT();
         printRawAGMTIMU(rawData);
     }
 
@@ -156,21 +196,24 @@ void loop()
 
     // Do some signal processing and running the EKF filtering here
     // There are 2 measurements of gyroZ and distance by the ultrasonic
-    double z[Mobs] = {myICM.gyrZ(), hcsr04.measureDistance(true)};
+    double z[Mobs] = {myICM.gyrZ(), myICM.accX(), myICM.accY()};
     ekf.step(z);
 
     // Report measured and predicte/fused values
+    // 2 measurements and 3 states
     Serial.print(z[0]);
     Serial.print(" ");
     Serial.print(z[1]);
     Serial.print(" ");
-    Serial.print(z[2]);
-    Serial.print(" ");
     Serial.print(ekf.getX(0));
     Serial.print(" ");
-    Serial.println(ekf.getX(1));
+    Serial.print(ekf.getX(1));
+    Serial.print(" ");
+    Serial.println(ekf.getX(2));
 
-    // TODO: Control the servo here
+    // delay to allow the servo motor to move to the new position
+    // Calculate the desired direction
+    updateCarMovement();
 
     delay(100);
 }
@@ -397,4 +440,115 @@ car_direction updateOrientation(void)
     if (left <= right)
       return car_direction::RIGHT; //represents turn right
     return car_direction::LEFT;//turn left
+}
+
+void updateCarMovement(void) 
+{
+    // Get the current posX, posY, and theta values from the EKF
+    double posX = ekf.getX(0);
+    double posY = ekf.getX(1);
+    double theta = ekf.getX(2);
+
+    // Updated desired direction based on 3 states position X, Y and orientation
+    car_direction desiredDirection = calculateDesiredDirection(posX, posY, theta);
+
+    // Update servo motors based on the determined direction
+    updateServoMotors(desiredDirection);
+}
+
+// Returns the Euclidean distance between two points
+double distance(Point a, Point b) 
+{
+    return sqrt(pow(a.x - b.x, 2) + pow(a.y - b.y, 2));
+}
+
+// Function to calculate the desired direction based on the current position (posX, posY) and orientation (theta)
+car_direction calculateDesiredDirection(double posX, double posY, double theta) 
+{
+    // Define a threshold distance to consider a waypoint reached
+    const double threshold = 0.5;
+
+    // Find the closest waypoint
+    int closestWaypoint = 0;
+    double minDistance = distance(waypoints[0], Point{posX, posY});
+
+    int iteration = sizeof(waypoints)/sizeof(Point);
+
+    for (int i = 1; i < iteration; i++) 
+    {
+        double currentDistance = distance(waypoints[i], Point{posX, posY});
+        if (currentDistance < minDistance) 
+        {
+            closestWaypoint = i;
+            minDistance = currentDistance;
+        }
+    }
+
+    // Check if the car is close enough to the waypoint
+    if (minDistance < threshold) 
+    {
+        // Move to the next waypoint in the list (circular)
+        closestWaypoint = (closestWaypoint + 1) % iteration;
+    }
+
+    // Calculate the angle to the closest waypoint
+    double angleToWaypoint = atan2(waypoints[closestWaypoint].y - posY, waypoints[closestWaypoint].x - posX);
+
+    // Calculate the difference between the current orientation and the angle to the waypoint
+    double angleError = angleToWaypoint - theta;
+
+    // Make sure the angle error is between -pi and pi
+    while (angleError > M_PI) 
+    {
+        angleError -= 2 * M_PI;
+    }
+    while (angleError < -M_PI) 
+    {
+        angleError += 2 * M_PI;
+    }
+
+    // Determine the desired direction based on the angle error
+    car_direction desiredDirection;
+    if (fabs(angleError) < M_PI / 8) 
+    {  
+        desiredDirection = car_direction::FORWARD;
+    } 
+    else if (angleError > 0) 
+    {
+        desiredDirection = car_direction::LEFT;
+    } 
+    else 
+    {
+        desiredDirection = car_direction::RIGHT;
+    }
+
+    return desiredDirection;
+}
+
+// Update the Servo Motor to control car wheels
+void updateServoMotors(car_direction desiredDirection) 
+{
+    switch (desiredDirection) 
+    {
+        case car_direction::LEFT:
+            steeringServo.write(70);
+            throttleServo.write(180);
+            break;
+
+        case car_direction::RIGHT:
+            steeringServo.write(110);
+            throttleServo.write(180);
+            break;
+
+        case car_direction::BACKWARD:
+            steeringServo.write(90);
+            throttleServo.write(0);
+            break;
+
+        case car_direction::FORWARD:
+        default:
+            steeringServo.write(90);
+            throttleServo.write(180);
+            break;
+    }
 }
