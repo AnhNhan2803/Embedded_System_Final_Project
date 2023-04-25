@@ -18,18 +18,18 @@ ultrasonic::ultrasonic(byte trigger, byte echo, int maxDistanceCm)
 	// Get the port mode register for the trigger pin
 	_triggerMode = (uint8_t *) portModeRegister(digitalPinToPort(trigger));
 
-	_maxEchoTime = (int)((maxDistanceCm * 2)/SPEED_OF_SOUND_CM) ;
+	_maxEchoTime = (int)(maxDistanceCm * SPEED_OF_SOUND_CM_COEF + SPEED_OF_SOUND_CM_COEF/2);
 }
 
 int ultrasonic::measureDistance(bool isCm)
 {
-	int ret;
+	int ret = 0;
 	if (!trigger()) return NO_ECHO; // Trigger a ping, if it returns false, return NO_ECHO to the calling function.
 
-	while (*_echoInput & _echoBit)                // Wait for the ping echo.
+	while (*_echoInput & _echoBit)		       // Wait for the ping echo.
 		if (micros() > _max_time) return NO_ECHO;   // Stop the loop and return NO_ECHO (false) if we're beyond the set maximum distance.
 
-	int duration = (micros() - (_max_time - _maxEchoTime) - PING_OVERHEAD);
+	long duration = (micros() - (_max_time - _maxEchoTime) - PING_OVERHEAD);
 
 	if(isCm)
 	{
@@ -46,12 +46,12 @@ int ultrasonic::measureDistance(bool isCm)
 // Time to distance convertor
 float ultrasonic::microsecondsToInches(long microseconds) 
 {
-	return ((microseconds*SPEED_OF_SOUND_INCH)/2); 
+	return (microseconds/SPEED_OF_SOUND_INCH_COEF); 
 }
 
 float ultrasonic::microsecondsToCentimeters(long microseconds) 
 {
-	return ((microseconds*SPEED_OF_SOUND_CM)/2); 
+	return (microseconds/SPEED_OF_SOUND_CM_COEF); 
 }
 
 bool ultrasonic::trigger() 

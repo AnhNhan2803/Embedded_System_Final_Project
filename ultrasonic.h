@@ -8,8 +8,8 @@
 #define NO_ECHO 0               // Value returned if there's no ping echo within the specified MAX_SENSOR_DISTANCE or max_cm_distance. Default=0
 #define MAX_SENSOR_DELAY 5800   // Maximum uS it takes for sensor to start the ping. Default=5800
 #define PING_OVERHEAD 5         // Ping overhead in microseconds (uS). Default=5
-#define SPEED_OF_SOUND_CM      34 // 34cm/ms
-#define SPEED_OF_SOUND_INCH    13.3858f // 13.4 inch/ms
+#define SPEED_OF_SOUND_CM_COEF   57 // (2 / 0.034 cm/us)
+#define SPEED_OF_SOUND_INCH_COEF 146 // (2 / 0.0134 inch/ms)
 
 class ultrasonic 
 {
