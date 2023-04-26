@@ -9,41 +9,47 @@
 /*******************************************************************************
 * INCLUDE
 *******************************************************************************/
-#include <avr/pgmspace.h>
+#include <Adafruit_MotorShield.h>
 #include <Wire.h>
 #include <Servo.h>
 #include <ICM_20948.h>
 #include "ultrasonic.h"
-// #include "HCSR04.h"
 
 // These must be defined before including TinyEKF.h
-#define Nsta 3 // 3 state values: posX, posY, and orientation
-#define Mobs 3 // 3 measurements: gyroZ, accelX, and accelY
-// #define Mobs 4 // 4 measurements: gyroZ, accelX, and accelY and distance (optional due to the lack of resources)
-
+#define Nsta 2 // 1 state values: orientation (or the yaw euler angle)
+#define Mobs 4 // 3 measurements: gyroZ, and (accelX, accelY, accelZ) or (magX, magY, MagZ)
 #include <TinyEKF.h>
 
 /******************************************************************************
 * PREPROCESSOR CONSTANTS
 *******************************************************************************/
 #define AD0_VAL           1
-#define SERVO_LEFT_ANGLE  30
-#define SERVO_RIGHT_ANGLE 150
-#define SERVO_STRIGHT     90
+#define SERVO_LEFT_ANGLE  83
+#define SERVO_RIGHT_ANGLE 83
+#define SERVO_STRIGHT     83
+#define MAX_OBSTACLE_THRESHOLD   30
+#define RAD_TO_DEDGREE    57.3
+#define MAX_ANGLE_THRESHOLD 5
 
 /******************************************************************************
 * PREPROCESSOR MACROS
 *******************************************************************************/
+// #define QUAT_ANIMATION // Uncomment this line to output data in the correct format for ZaneL's Node.js Quaternion animation tool: https://github.com/ZaneL/quaternion_sensor_3d_nodejs
 
+// Define USE_ADVANCED_IMU_FEATURE if we want the DMP within the IMU sensor to 
+// calculate the filtered orientation without the involvement of Kalman filter
+// #define USE_ADVANCED_IMU_FEATURE
+// #define CAR_TESTING
 
 /******************************************************************************
 * TYPEDEFS
 *******************************************************************************/
-enum class car_direction{
-    FORWARD = 0,
-    BACKWARD,
+enum class carState{
+    STRAIGHT = 0,
+    BACK,
     LEFT,
-    RIGHT
+    RIGHT,
+    STOP
 };
 
 struct Point {
@@ -51,63 +57,87 @@ struct Point {
   double y;
 };
 
+
+/// @brief ////////////////////////////////////////////////////
+// struct Waypoint {
+//   int id;
+//   float x;
+//   float y;
+//   float direction; // angle in degrees
+// };
+
+// const int numWaypoints = 3;
+
+// Waypoint waypoints[numWaypoints] = {
+//   {0, 0, 0, 0},       // A
+//   {1, 10, 0, 0},      // B
+//   {2, 10, 10, 90}     // C
+// };
+
+// struct Edge {
+//   int startId;
+//   int endId;
+//   float distance;
+// };
+
+// const int numEdges = 2;
+
+// Edge edges[numEdges] = {
+//   {0, 1, 10}, // connection between A and B
+//   {1, 2, 10}  // connection between B and C
+// };
+
 class Fuser : public TinyEKF {
     public:
         Fuser() 
         {
-            for (int i = 0; i < Nsta; ++i) 
+            for (uint8_t i = 0; i < Nsta; ++i) 
             {
                 setQ(i, i, 0.001);
             }
 
-            for (int i = 0; i < Mobs; ++i) 
+            for (uint8_t i = 0; i < Mobs; ++i) 
             {
                 setR(i, i, 0.01);
             }
         }
 
+        void syncDeltaTime(double dt)
+        {
+            deltaTime = dt;
+        }
+
     protected:
+        double deltaTime;
+
         void Fuser::model(double fx[Nsta], double F[Nsta][Nsta], double hx[Mobs], double H[Mobs][Nsta]) 
         {
             // Process model
-            double dt = 0.1; // Time step, assuming constant
+            fx[0] = this->x[0]; // Orientation (yaw) as the state
 
-            // double gyroZ = this->z[0]; // Get the gyroZ measurement from the EKF's z array
-
-            // Process model is f(x) = x, try to make it linearly
-            fx[0] = this->x[0]; // Keep posX constant
-            fx[1] = this->x[1]; // Keep posY constant
-            // fx[2] = this->x[2] + dt * gyroZ; // Update orientation based on gyroZ measurement
-            fx[2] = this->x[2] + dt * this->x[2]; // Update orientation based on gyroZ measurement
-
-            // So process model Jacobian is identity matrix
+            // So process model Jacobian is an identity matrix
             F[0][0] = 1;
-            F[1][1] = 1;
-            F[2][2] = 1;
 
             // Measurement model (hx)
-            hx[0] = this->x[2]; // gyroZ is directly mapped to orientation
-            hx[1] = this->x[0]; // accelX is directly mapped to posX
-            hx[2] = this->x[1]; // accelY is directly mapped to posY
+            hx[0] = this->x[0]; // gyroZ is related to orientation (yaw)
+            hx[1] = this->x[0]; // magnetometers XvsY is related to orientation (yaw)
 
             // Measurement model Jacobian (H)
-            H[0][2] = 1; // gyroZ to orientation
-            H[1][0] = 1; // accelX to posX
-            H[2][1] = 1; // accelY to posY
+            H[0][0] = 1; // gyroZ to orientation (yaw)
+            H[1][0] = 1; // magnetometers to orientation (yaw)
         }
 };
 
 /******************************************************************************
 * VARIABLE DEFINITIONS
 *******************************************************************************/
-const byte pingPin = 9; // Trigger Pin of Ultrasonic Sensor
-const byte echoPin = 10; // Echo Pin of Ultrasonic Sensor
-ultrasonic hcsr04(pingPin, echoPin, 400); 
+const byte pingPin = 3; // Trigger Pin of Ultrasonic Sensor
+const byte echoPin = 2; // Echo Pin of Ultrasonic Sensor
+
+ultrasonic hcsr04(pingPin, echoPin, 400);
+
 ICM_20948_I2C myICM;
 Servo servo;
-Servo servoMotorLeft;   
-Servo servoMotorRight;
-Fuser ekf;
 
 // Temporarily predefined path at the beginning, will edit later
 Point waypoints[4] = {
@@ -117,9 +147,18 @@ Point waypoints[4] = {
   {0, 10}
 };
 
-// Servo motor objects for steering and throttle control
-Servo steeringServo;
-Servo throttleServo;
+Adafruit_MotorShield AFMS = Adafruit_MotorShield();
+// Select motor M1 and M2
+Adafruit_DCMotor *rightMotor = AFMS.getMotor(1);
+Adafruit_DCMotor *leftMotor = AFMS.getMotor(2);
+const int carMaxSpeed = 200;
+
+float gyroZError = 0.0;
+float driftYawAngle;
+float gyroYawAngle;
+
+carState systemState = carState::STOP;
+Fuser ekf;
 
 /******************************************************************************
 * FUNCTION PROTOTYPES
@@ -127,10 +166,14 @@ Servo throttleServo;
 void initializeIMU(void);
 void printRawAGMTIMU(ICM_20948_AGMT_t agmt);
 void printPaddedInt16bIMU(int16_t val);
-car_direction updateOrientation(void);
 double distance(Point a, Point b);
-void updateCarMovement(void);
-void updateServoMotors(car_direction desiredDirection);
+void updateCarMovement(float yawAngle, carState direction);
+void updateServoMotors(carState desiredDirection, uint8_t leftSpeed, uint8_t rightSpeed);
+
+float driftHeadingvsNorth(void);
+bool detectObstacle(void);
+bool detectDeadEnd(void);
+carState updatePath(void);
 
 /******************************************************************************
 * 2 MAIN ENTRANCE FUNCTIONS
@@ -164,66 +207,152 @@ void setup()
     initializeIMU();
 
     /********************* Servo Setup **********************/
-    byte servoPin = 11;
+    byte servoPin = 10;
     servo.attach(servoPin);
 
-    // Attach the servo motors to the corresponding pins
-    steeringServo.attach(3);
-    throttleServo.attach(5);
+    // Initialize the motorshield here
+    if (!AFMS.begin()) 
+    {         
+        // create with the default frequency 1.6KHz
+        Serial.println("Could not find Motor Shield. Check wiring.");
+        while (1);
+    }
+    Serial.println("Motor Shield found.");
 
-    // Initialize the servo motors
-    steeringServo.write(90);
-    throttleServo.write(90);
+    // Set the speed to start, from 0 (off) to 255 (max speed)
+    rightMotor->setSpeed(150);
+    rightMotor->run(FORWARD);
+    // turn on motor
+    rightMotor->run(RELEASE);
 
-    // Start some configuration for signal processing and 
-    // required algorithms here
+    leftMotor->setSpeed(150);
+    leftMotor->run(FORWARD);
+    // turn on motor
+    leftMotor->run(RELEASE);
+
+    // Calibrate the error coefficient of IMU gyroscope in resting
+    for (int i=0; i<200; i++)
+    {
+        myICM.getAGMT();
+        gyroZError += myICM.gyrZ();     
+    }
+    gyroZError /= 200;
+
+    // Determinte the initial drift between the current heading and the North
+    driftYawAngle = driftHeadingvsNorth();
+    gyroYawAngle = driftYawAngle;
 }
 
 void loop() 
 {
-    static ICM_20948_AGMT_t rawData ;
+    ICM_20948_AGMT_t rawData ;
+    static uint32_t timer = 0;
+
+    // Measure the detatime of each sensors samples collection
+    double dt = (timer != 0) ? ((double)(micros() - timer) / 1000000) : 0; // Calculate delta time in s
+    timer = micros();
+
     // Get IMU data
     if(myICM.dataReady())
     {
         rawData = myICM.getAGMT();
-        printRawAGMTIMU(rawData);
+        // printRawAGMTIMU(rawData);
     }
 
-    // delay(2);
+    // Assign to local variable for simple debugging first
+    // float accelX = myICM.accX();
+    // float accelY = myICM.accY();
+    // float accelZ = myICM.accZ();
 
-    // Process the Ultrasonic sensor here
-    // car_direction direction = updateOrientation();
+    // float gyroX = myICM.gyrX();
+    // float gyroY = myICM.gyrY();
+    float gyroZ = myICM.gyrZ();
+
+    float magX = myICM.magX();
+    float magY = myICM.magY();
+    // float magZ = myICM.magZ();
+
+
+    // Calculate the yaw angle based on magnetometer data and pitch+roll
+    // float pitch = atan2(accelY ,( sqrt ((accelX * accelX) + (accelZ * accelZ))));
+    // float roll = atan2(-accelX ,( sqrt((accelY * accelY) + (accelZ * accelZ))));
+
+    // float Yh = (magZ * sin(roll)) + (magX * cos(roll));
+    // float Xh = (magY * cos(roll)) + (magX * sin(roll) * sin(pitch)) - (magZ * sin(roll) * cos(pitch));
+
+    // float yawMag = atan2(Yh, Xh) * RAD_TO_DEDGREE;
+
+    // Calculate the yaw angle based on accelerometer
+    // yaw =  atan(sqrt((accelX * accelX) + (accelY * accelY)) / accelZ) * RAD_TO_DEDGREE;
+
+    // Yaw angle measured directly from the gyroscope_Z
+    gyroYawAngle += (gyroZ - gyroZError) * dt;
+    // The yaw angle measured by Magnetometer is relative to the North
+    float magYawAngle = atan2(magY, magX) * RAD_TO_DEDGREE;
 
     // Do some signal processing and running the EKF filtering here
     // There are 2 measurements of gyroZ and distance by the ultrasonic
-    double z[Mobs] = {myICM.gyrZ(), myICM.accX(), myICM.accY()};
+    double z[Mobs] = {gyroYawAngle, magYawAngle}; // CHANGE: Measurement vector
+    ekf.syncDeltaTime(dt);
     ekf.step(z);
 
     // Report measured and predicte/fused values
-    // 2 measurements and 3 states
-    Serial.print(z[0]);
-    Serial.print(" ");
-    Serial.print(z[1]);
-    Serial.print(" ");
-    Serial.print(ekf.getX(0));
-    Serial.print(" ");
-    Serial.print(ekf.getX(1));
-    Serial.print(" ");
-    Serial.println(ekf.getX(2));
+    float filteredYawAngle = ekf.getX(0);
+
+    Serial.print("gyroYawAngle: ");
+    Serial.println(gyroYawAngle);
+    Serial.print("magYawAngle: ");
+    Serial.println(magYawAngle);
+
+    Serial.print("Heading: ");
+    Serial.println(filteredYawAngle);
+    Serial.println("");
+
+    bool obstacleDetected = detectObstacle();
+    bool deadEndDetected = detectDeadEnd();
+
+    // Update the car's planned path if necessary
+    carState desiredDirection = carState::STRAIGHT;
+    if (obstacleDetected || deadEndDetected) 
+    {
+        desiredDirection = updatePath();
+    }
+
+    // Handle the carState::STOP case
+    if (desiredDirection == carState::STOP) 
+    {
+        // Stop the car
+        leftMotor->run(RELEASE);
+        rightMotor->run(RELEASE);
+        
+        // Add any additional actions here, such as:
+        // - Notify the user
+        // - Attempt to backtrack
+        // - Wait for the obstacles to be removed
+
+        // Add a delay to pause the loop for a certain amount of time
+        delay(1000); // Wait for 1 second
+
+        // After taking appropriate actions, re-check for obstacles and update the path
+        obstacleDetected = detectObstacle();
+        deadEndDetected = detectDeadEnd();
+        if (obstacleDetected || deadEndDetected) 
+        {
+            desiredDirection = updatePath();
+        }
+    }
 
     // delay to allow the servo motor to move to the new position
     // Calculate the desired direction
-    updateCarMovement();
-
-    delay(100);
+    updateCarMovement(magYawAngle, desiredDirection);
 }
-
 
 /******************************************************************************
 * STATIC FUNCTIONS
 *******************************************************************************/
 void initializeIMU(void)
 {
+
     bool initialized = false;
     while (!initialized)
     {
@@ -246,10 +375,11 @@ void initializeIMU(void)
     myICM.swReset();
     if (myICM.status != ICM_20948_Stat_Ok)
     {
-    Serial.print(F("Software Reset returned: "));
-    Serial.println(myICM.statusString());
+        Serial.print(F("Software Reset returned: "));
+        Serial.println(myICM.statusString());
     }
     delay(250);
+    bool success = true; // Use success to show if the DMP configuration was successful
 
     // Now wake the sensor up
     myICM.sleep(false);
@@ -344,11 +474,8 @@ void initializeIMU(void)
 
     // Choose whether or not to start the magnetometer
     myICM.startupMagnetometer();
-    if (myICM.status != ICM_20948_Stat_Ok)
-    {
-        Serial.print(F("startupMagnetometer returned: "));
-        Serial.println(myICM.statusString());
-    }
+    Serial.print(F("startupMagnetometer returned: "));
+    Serial.println(myICM.statusString());
 
     Serial.println();
     Serial.println(F("Configuration complete!"));
@@ -362,39 +489,39 @@ void printPaddedInt16bIMU(int16_t val)
     Serial.print(" ");
     if (val < 10000)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
     if (val < 1000)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
     if (val < 100)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
     if (val < 10)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
   }
   else
   {
-    Serial.print("-");
+    Serial.print(F("-"));
     if (abs(val) < 10000)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
     if (abs(val) < 1000)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
     if (abs(val) < 100)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
     if (abs(val) < 10)
     {
-      Serial.print("0");
+      Serial.print(F("0"));
     }
   }
   Serial.print(abs(val));
@@ -402,59 +529,221 @@ void printPaddedInt16bIMU(int16_t val)
 
 void printRawAGMTIMU(ICM_20948_AGMT_t agmt)
 {
-  Serial.print("RAW. Acc [ ");
+  Serial.print(F("RAW. Acc [ "));
   printPaddedInt16bIMU(agmt.acc.axes.x);
-  Serial.print(", ");
+  Serial.print(F(", "));
   printPaddedInt16bIMU(agmt.acc.axes.y);
-  Serial.print(", ");
+  Serial.print(F(", "));
   printPaddedInt16bIMU(agmt.acc.axes.z);
-  Serial.print(" ], Gyr [ ");
+  Serial.print(F(" ], Gyr [ "));
   printPaddedInt16bIMU(agmt.gyr.axes.x);
-  Serial.print(", ");
+  Serial.print(F(", "));
   printPaddedInt16bIMU(agmt.gyr.axes.y);
-  Serial.print(", ");
+  Serial.print(F(", "));
   printPaddedInt16bIMU(agmt.gyr.axes.z);
-  Serial.print(" ], Mag [ ");
+  Serial.print(F(" ], Mag [ "));
   printPaddedInt16bIMU(agmt.mag.axes.x);
-  Serial.print(", ");
+  Serial.print(F(", "));
   printPaddedInt16bIMU(agmt.mag.axes.y);
-  Serial.print(", ");
+  Serial.print(F(", "));
   printPaddedInt16bIMU(agmt.mag.axes.z);
-  Serial.print(" ], Tmp [ ");
+  Serial.print(F(" ], Tmp [ "));
   printPaddedInt16bIMU(agmt.tmp.val);
-  Serial.print(" ]");
+  Serial.print(F(" ]"));
   Serial.println();
 }
 
-car_direction updateOrientation(void)
+///////////////////////////////////////////////////////////
+// Car control functions
+
+// void updateCarMovement(double distance)
+// {
+//     const double distanceThreshold = 10;
+//     const int turningDelay = 500;
+
+//     if (distance < distanceThreshold)
+//     {
+//         // If an obstacle is detected, stop the car
+//         throttleServo.write(throttleValueStop);
+//         delay(1000); // Wait for a moment
+
+//         // Turn the car to find a new path
+//         steeringServo.write(steeringAngleLeft);
+//         throttleServo.write(throttleValueForward);
+//         delay(turningDelay); // Adjust this delay based on the turning time required
+
+//         // Move forward again
+//         steeringServo.write(steeringAngleCenter);
+//     }
+//     else
+//     {
+//         // If there is no obstacle, continue moving forward
+//         steeringServo.write(steeringAngleCenter);
+//         throttleServo.write(throttleValueForward);
+//     }
+// }
+
+
+void updateCarMovement(float yawAngle, carState direction)
 {
-    delay(20);
+    // Analyze the car orientation here to ensure that the car is moving straight
+    int leftMotorSpeed = carMaxSpeed;
+    int rightMotorSpeed = carMaxSpeed;
+    carState desiredDirection;
+
+#ifndef CAR_TESTING
+    if (systemState == carState::STRAIGHT)
+    {
+        // The desired straight angle, assuming 0 degrees is straight or we can assign it directly
+        // to the drift angle between car's heading orientation and the North
+        const float desiredYaw = driftYawAngle;
+
+        // Proportional control constant
+        const float Kp = 5;
+
+        // Calculate the error between the current yaw angle and the desired straight angle
+        const float error = desiredYaw - yawAngle;
+
+        // Calculate the speed adjustment based on the error and the proportional control constant
+        int speedAdjustment = Kp * error;
+
+        // Limit the speed adjustment to be within the motor's speed range
+        speedAdjustment = constrain(speedAdjustment, -carMaxSpeed, carMaxSpeed);
+
+        // Calculate the individual motor speeds
+        leftMotorSpeed = carMaxSpeed - speedAdjustment;
+        rightMotorSpeed = carMaxSpeed + speedAdjustment;
+
+        // Ensure the motor speeds are within the motor's speed range
+        leftMotorSpeed = constrain(leftMotorSpeed, 0, carMaxSpeed);
+        rightMotorSpeed = constrain(rightMotorSpeed, 0, carMaxSpeed);
+        desiredDirection = carState::STRAIGHT;
+    }
+    else
+    {
+        // We do not need to do any orientation correction during turning sides
+        desiredDirection = carState::STRAIGHT;
+    }
+
+    updateServoMotors(desiredDirection, leftMotorSpeed, rightMotorSpeed);
+
+#else
+    updateServoMotors(carState::STRAIGHT, carMaxSpeed, carMaxSpeed);
+#endif
+}
+
+// This function will be called at the startup phase or when the car just change the direction
+float driftHeadingvsNorth(void)
+{
+    uint8_t idx = 0;
+    float drift;
+
+    while(1)
+    {
+        if(myICM.dataReady())
+        {
+            myICM.getAGMT();
+            drift += (atan2(myICM.magY(), myICM.magX()) * RAD_TO_DEDGREE);
+            if(++idx == 10)
+            {
+                break;
+            }
+        }
+    }
+
+    // Calculate the average value to reduce the bias
+    drift /= idx;
+
+    return drift;
+}
+
+bool detectObstacle(void) 
+{
+    // Calculate the distance to the obstacle, measure the distance 3 times
+    // and take average value to reduce the noise
+    int distance = 0;
+    for (uint8_t idx=0; idx<3; idx++)
+    {
+        distance+=hcsr04.measureDistance(true);
+    }
+    distance/=3;
+
+    // If there's an obstacle within a certain distance threshold, return true
+    if (distance < MAX_OBSTACLE_THRESHOLD) 
+    {
+        return true;
+    }
+    return false;
+}
+
+
+bool detectDeadEnd(void) 
+{
+    bool leftObstacle, rightObstacle, frontObstacle;
+
+    // Check for an obstacle in front of the car
+    servo.write(SERVO_STRIGHT);
+    delay(200); // Give the servo time to rotate
+    frontObstacle = detectObstacle();
+
+
+    // Rotate the ultrasonic sensor to the left
     servo.write(SERVO_LEFT_ANGLE);
-    delay(350);
-    float left = hcsr04.measureDistance(true);
+    delay(200); // Give the servo time to rotate
+    leftObstacle = detectObstacle();
+
+    // Rotate the ultrasonic sensor to the right
     servo.write(SERVO_RIGHT_ANGLE);
-    delay(450);
-    float right = hcsr04.measureDistance(true);
+    delay(200); // Give the servo time to rotate
+    rightObstacle = detectObstacle();
+
+    // Rotate the ultrasonic sensor back to the center
+    servo.write(SERVO_STRIGHT);
+    delay(200); // Give the servo time to rotate
+
+    // If obstacles are detected in all directions, it's a dead end
+    if (leftObstacle && rightObstacle && frontObstacle) {
+        return true;
+    }
+
+    return false;
+}
+
+carState updatePath(void) 
+{
+    carState direction;
+    // Check for obstacles in front, left, and right directions
+    bool frontObstacle = detectObstacle();
+    servo.write(SERVO_LEFT_ANGLE);
+    delay(200);
+    bool leftObstacle = detectObstacle();
+    servo.write(SERVO_RIGHT_ANGLE);
+    delay(200);
+    bool rightObstacle = detectObstacle();
     servo.write(SERVO_STRIGHT);
     delay(200);
-    if (left <= right)
-      return car_direction::RIGHT; //represents turn right
-    return car_direction::LEFT;//turn left
+
+    // Decide on a direction based on the presence of obstacles
+    if (!frontObstacle) 
+    {
+        direction = carState::STRAIGHT;
+    } 
+    else if (!leftObstacle) 
+    {
+        direction = carState::LEFT;
+    } 
+    else if (!rightObstacle) 
+    {
+        direction = carState::RIGHT;
+    } 
+    else 
+    {
+        direction = carState::STOP;
+    }
+
+    return direction;
 }
 
-void updateCarMovement(void) 
-{
-    // Get the current posX, posY, and theta values from the EKF
-    double posX = ekf.getX(0);
-    double posY = ekf.getX(1);
-    double theta = ekf.getX(2);
-
-    // Updated desired direction based on 3 states position X, Y and orientation
-    car_direction desiredDirection = calculateDesiredDirection(posX, posY, theta);
-
-    // Update servo motors based on the determined direction
-    updateServoMotors(desiredDirection);
-}
 
 // Returns the Euclidean distance between two points
 double distance(Point a, Point b) 
@@ -463,18 +752,18 @@ double distance(Point a, Point b)
 }
 
 // Function to calculate the desired direction based on the current position (posX, posY) and orientation (theta)
-car_direction calculateDesiredDirection(double posX, double posY, double theta) 
+carState calculateDesiredDirection(double posX, double posY, double theta) 
 {
     // Define a threshold distance to consider a waypoint reached
     const double threshold = 0.5;
 
     // Find the closest waypoint
-    int closestWaypoint = 0;
+    uint8_t closestWaypoint = 0;
     double minDistance = distance(waypoints[0], Point{posX, posY});
 
-    int iteration = sizeof(waypoints)/sizeof(Point);
+    uint8_t iteration = (uint8_t)sizeof(waypoints)/sizeof(Point);
 
-    for (int i = 1; i < iteration; i++) 
+    for (uint8_t i = 1; i < iteration; i++) 
     {
         double currentDistance = distance(waypoints[i], Point{posX, posY});
         if (currentDistance < minDistance) 
@@ -508,47 +797,57 @@ car_direction calculateDesiredDirection(double posX, double posY, double theta)
     }
 
     // Determine the desired direction based on the angle error
-    car_direction desiredDirection;
+    carState desiredDirection;
     if (fabs(angleError) < M_PI / 8) 
     {  
-        desiredDirection = car_direction::FORWARD;
+        desiredDirection = carState::STRAIGHT;
     } 
     else if (angleError > 0) 
     {
-        desiredDirection = car_direction::LEFT;
+        desiredDirection = carState::LEFT;
     } 
     else 
     {
-        desiredDirection = car_direction::RIGHT;
+        desiredDirection = carState::RIGHT;
     }
 
     return desiredDirection;
 }
 
 // Update the Servo Motor to control car wheels
-void updateServoMotors(car_direction desiredDirection) 
+void updateServoMotors(carState desiredDirection, uint8_t leftSpeed, uint8_t rightSpeed) 
 {
-    switch (desiredDirection) 
+    systemState = desiredDirection;
+
+    switch (systemState) 
     {
-        case car_direction::LEFT:
-            steeringServo.write(70);
-            throttleServo.write(180);
+        case carState::LEFT:
+            rightMotor->run(FORWARD);
+            leftMotor->run(RELEASE);
+            rightMotor->setSpeed(rightSpeed);
+            leftMotor->setSpeed(leftSpeed);
             break;
 
-        case car_direction::RIGHT:
-            steeringServo.write(110);
-            throttleServo.write(180);
+        case carState::RIGHT:
+            rightMotor->run(RELEASE);
+            leftMotor->run(FORWARD);
+            rightMotor->setSpeed(rightSpeed);
+            leftMotor->setSpeed(leftSpeed);
             break;
 
-        case car_direction::BACKWARD:
-            steeringServo.write(90);
-            throttleServo.write(0);
+        case carState::BACK:
+            rightMotor->run(BACKWARD);
+            leftMotor->run(BACKWARD);
+            rightMotor->setSpeed(rightSpeed);
+            leftMotor->setSpeed(leftSpeed);
             break;
 
-        case car_direction::FORWARD:
+        case carState::STRAIGHT:
         default:
-            steeringServo.write(90);
-            throttleServo.write(180);
+            rightMotor->run(FORWARD);
+            leftMotor->run(FORWARD);
+            rightMotor->setSpeed(rightSpeed);
+            leftMotor->setSpeed(leftSpeed);
             break;
     }
 }
