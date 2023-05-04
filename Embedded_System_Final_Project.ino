@@ -121,8 +121,8 @@ Adafruit_MotorShield AFMS = Adafruit_MotorShield();
 // Select motor M1 and M2
 Adafruit_DCMotor *rightMotor = AFMS.getMotor(1);
 Adafruit_DCMotor *leftMotor = AFMS.getMotor(2);
-const int carMaxSpeed = 120;
-const int carMinSpeed = 70;
+const int carMaxSpeed = 150;
+const int carMinSpeed = 100;
 
 #ifdef IMU_CALIBRATION_ACCEL_GYRO
 float gyroZError = 0.0;
@@ -536,45 +536,45 @@ void loop()
         int centerDistance = 0;
         int rightDistance = 0;
 
-        for (uint8_t idx=0; idx<3; idx++)
+        for (uint8_t idx=0; idx<2; idx++)
         {
             centerDistance += hcsr04Center.measureDistance(true);
             rightDistance += hcsr04Right.measureDistance(true);
         }
 
-        centerDistance/=3;
-        rightDistance/=3;
+        centerDistance/=2;
+        rightDistance/=2;
 
         Serial.print(F("Right distance: "));
         Serial.println(rightDistance);
         Serial.print(F("Center distance: "));
         Serial.println(centerDistance);
 
-        if(centerDistance > 10)
+        if(centerDistance > 11 || centerDistance == 0 /*Too far to measure*/)
         {
-            if(rightDistance > 11)
+            if(rightDistance > 11 or rightDistance == 0 /*Too far to measure*/)
             {
                 // Slight right
-                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 150, 50);
+                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 150, 60);
             }
-            else if(rightDistance  > 8 && rightDistance <= 11)
+            else if(rightDistance  > 6 && rightDistance <= 9)
             {
                 // Reset all IMU parameters here 
                 resetIMUParameters();
                 // Move forward
-                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 250, 250);
+                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 150, 150);
             }
             else
             {
-                updateCarMovement(filteredYawAngle, carState::LEFT, 120, 120);
+                updateCarMovement(filteredYawAngle, carState::LEFT, 110, 110);
             }
         }
         else
         {
             // Stop first
-            updateCarMovement(filteredYawAngle, carState::STOP, 0, 0);
+            // updateCarMovement(filteredYawAngle, carState::STOP, 0, 0);
 
-            if(rightDistance <= 11)
+            if(rightDistance <= 9)
             {
                 updateCarMovement(filteredYawAngle, carState::ROTATE_LEFT_90, 150, 150);
             }
@@ -590,7 +590,7 @@ void loop()
         updateCarMovement(filteredYawAngle, carState::STOP, 0, 0);
     }
 
-    delay(40);
+    delay(20);
 }
 
 /******************************************************************************
@@ -926,7 +926,7 @@ void updateServoMotors(carState desiredDirection, uint8_t leftSpeed, uint8_t rig
             leftMotor->run(BACKWARD);
             rightMotor->setSpeed(rightSpeed);
             leftMotor->setSpeed(leftSpeed);
-            delay(450); 
+            delay(400); 
             rightMotor->run(RELEASE);
             leftMotor->run(RELEASE);
             break;
@@ -936,7 +936,7 @@ void updateServoMotors(carState desiredDirection, uint8_t leftSpeed, uint8_t rig
             leftMotor->run(FORWARD);
             rightMotor->setSpeed(rightSpeed);
             leftMotor->setSpeed(leftSpeed);
-            delay(450); 
+            delay(400); 
             rightMotor->run(RELEASE);
             leftMotor->run(RELEASE);
             break;
