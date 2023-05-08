@@ -35,12 +35,6 @@
 #define CALIBRATION_ITERATIONS      200
 #define CALIBRATION_ITERATIONS_MAG  (CALIBRATION_ITERATIONS * 50) // 1min30 for magneto calibration
 
-// Macro for PID car control
-#define MAX_OBSTACLE_THRESHOLD      7
-// Need to tune this carefully
-#define MAX_WALL_THRESHOLD          MAX_OBSTACLE_THRESHOLD
-#define MAX_WALL_RIGHT_THRESHOLD    (MAX_OBSTACLE_THRESHOLD * 2)
-
 /******************************************************************************
 * PREPROCESSOR MACROS
 *******************************************************************************/
@@ -141,6 +135,7 @@ float driftYawAngle;
 float prevMagYawAngle;
 float cumulativeMagYawAngle;
 float gyroYawAngle;
+float filteredYawAngle;    
 
 Fuser ekf;
 
@@ -150,7 +145,7 @@ Fuser ekf;
 void initializeIMU(void);
 void printRawAGMTIMU(ICM_20948_AGMT_t agmt);
 void printPaddedInt16bIMU(int16_t val);
-void updateCarMovement(float yawAngle, carState direction, uint8_t leftSpeed, uint8_t rightSpeed);
+void updateCarMovement(carState direction, uint8_t leftSpeed, uint8_t rightSpeed);
 void updateServoMotors(carState desiredDirection, uint8_t leftSpeed, uint8_t rightSpeed);
 float driftHeadingvsNorth(void);
 void resetIMUParameters(void);
@@ -397,7 +392,6 @@ void setup()
 
     // Determinte the initial drift between the current heading and the North
     resetIMUParameters();
-    // gyroYawAngle = driftYawAngle;
 }
 
 // Loop
@@ -409,7 +403,6 @@ void loop()
     static bool isStartMotor = false;
     static int previousPIDErr = 0;
     static int integral = 0;
-    float filteredYawAngle;    
 
     // Measure the detatime of each sensors samples collection
     double dt = (timer != 0) ? ((double)(micros() - timer) / 1000000) : 0; 
@@ -483,15 +476,6 @@ void loop()
         ///////////////////////////////////////////////////////////////////////////////
         // Yaw angle calculated by the combination of accelerometer and magnetometer //
         ///////////////////////////////////////////////////////////////////////////////
-        // float roll = atan2(accelY, (sqrt((accelZ * accelZ) + (accelX * accelX))));
-        // float pitch = atan2(-accelX, (sqrt ((accelY * accelY) + (accelY * accelY))));
-
-        // // Calculate the compensation of of compass X and compass Y
-        // float Mx_comp = magX * cos(pitch) + magY * sin(roll) * sin(pitch) + magZ * cos(roll) * sin(pitch);
-        // float My_comp = magY * cos(roll) - magZ * sin(roll);
-
-        // // Calculate the final yaw angle based on magnetometer and accelerometer
-        // float magYawAngle = atan2(-My_comp, Mx_comp) * RAD_TO_DEDGREE * -1.0;
         float magYawAngle = -1.0 * atan2(magX, magY) * RAD_TO_DEDGREE;
 
 
@@ -529,7 +513,7 @@ void loop()
     }
 
     // Update car movement with the desired angle as output from EKF
-    if(!isStartMotor) // Only start control the motor under permission
+    if(isStartMotor) // Only start control the motor under permission
     {
         // Do the distance caculation here
 
@@ -555,39 +539,36 @@ void loop()
             if(rightDistance > 11 or rightDistance == 0 /*Too far to measure*/)
             {
                 // Slight right
-                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 150, 60);
+                updateCarMovement(carState::STRAIGHT, 150, 60);
             }
             else if(rightDistance  > 6 && rightDistance <= 9)
             {
                 // Reset all IMU parameters here 
                 resetIMUParameters();
                 // Move forward
-                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 150, 150);
+                updateCarMovement(carState::STRAIGHT, 150, 150);
             }
             else
             {
-                updateCarMovement(filteredYawAngle, carState::LEFT, 110, 110);
+                updateCarMovement(carState::LEFT, 110, 110);
             }
         }
         else
         {
-            // Stop first
-            // updateCarMovement(filteredYawAngle, carState::STOP, 0, 0);
-
             if(rightDistance <= 9)
             {
-                updateCarMovement(filteredYawAngle, carState::ROTATE_LEFT_90, 150, 150);
+                updateCarMovement(carState::ROTATE_LEFT_90, 150, 150);
             }
             else
             {
                 // Slight right
-                updateCarMovement(filteredYawAngle, carState::STRAIGHT, 150, 60);
+                updateCarMovement(carState::STRAIGHT, 150, 60);
             }
         }
     }
     else
     {
-        updateCarMovement(filteredYawAngle, carState::STOP, 0, 0);
+        updateCarMovement(carState::STOP, 0, 0);
     }
 
     delay(20);
@@ -810,7 +791,7 @@ void resetIMUParameters(void)
     cumulativeMagYawAngle = 0;
 }
 
-void updateCarMovement(float yawAngle, carState direction, uint8_t leftSpeed, uint8_t rightSpeed)
+void updateCarMovement(carState direction, uint8_t leftSpeed, uint8_t rightSpeed)
 {
     // Analyze the car orientation here to ensure that the car is moving straight
     int leftMotorSpeed = leftSpeed;
@@ -825,7 +806,7 @@ void updateCarMovement(float yawAngle, carState direction, uint8_t leftSpeed, ui
 
         // Calculate the speed adjustment based on the error (the lolerance between the curent yaw angle 
         // and the mark at the beginning) and the proportional control constant
-        int speedAdjustment = Kp * yawAngle;
+        int speedAdjustment = Kp * filteredYawAngle;
 
         // Limit the speed adjustment to be within the motor's speed range
         speedAdjustment = constrain(speedAdjustment, -carMaxSpeed, carMaxSpeed);
